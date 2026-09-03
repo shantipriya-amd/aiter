@@ -27,14 +27,10 @@ from aiter.ops.flydsl.kernels.tensor_shim import (
 
 MAX_EXPERTS_PER_BLOCK = 512
 
-# The ep_rowmap remap+scatter is grid-strided across this many blocks. Each block
-# re-derives the tiny per-expert prefix sum in LDS (barrier-free across blocks), so
-# no cross-block sync is needed. Sized to fill the 256-CU gfx1250; the grid-stride
-# loop stays correct for any token count.
-EP_REMAP_NBLK = 256
-
-# Same for the non-EP remap. One block (512 lanes) left the row remap latency-bound
-# on a 256-CU part: at 32K padded tokens that is ~768 dependent iterations per lane.
+# Both remap kernels are grid-strided across this many blocks. Each block re-derives
+# the tiny per-expert prefix sum in LDS (barrier-free across blocks), so no
+# cross-block sync is needed. Sized to fill the 256-CU gfx1250; the grid-stride loop
+# stays correct for any token count.
 REMAP_NBLK = 256
 
 
@@ -475,7 +471,7 @@ def build_moe_contiguous_psum_remap_ep_module():
         topk_v = fx.Uint32(topk)
         max_tok_v = fx.Uint32(max_tok)
         # Fused remap + ep_rowmap scatter over valid routes ([0, nvr)).
-        for route in range(gtid, nvr, EP_REMAP_NBLK * MAX_EXPERTS_PER_BLOCK):
+        for route in range(gtid, nvr, REMAP_NBLK * MAX_EXPERTS_PER_BLOCK):
             row_raw = rows_p[route]
             # A route with no grouped row carries DROPPED_ROUTE_ROW: the
             # masked->contiguous math would turn it into a wild expert index (OOB
@@ -537,7 +533,7 @@ def build_moe_contiguous_psum_remap_ep_module():
             max_tok,
             slot_stride,
         ).launch(
-            grid=(EP_REMAP_NBLK, 1, 1),
+            grid=(REMAP_NBLK, 1, 1),
             block=(MAX_EXPERTS_PER_BLOCK, 1, 1),
             stream=stream,
         )
