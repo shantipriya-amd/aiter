@@ -9,6 +9,7 @@ import subprocess
 from build_targets import (
     GFX_CU_NUM_MAP,
     GFX_MAP,
+    _cu_num_or_none,
     _parse_gpu_archs_env,
     _parse_gpu_targets_env,
     filter_tune_df,
@@ -287,6 +288,25 @@ def get_cu_num():
     return cu_num
 
 
+def _warn_cu_num_ignored(targets: list[tuple[str, int]]) -> None:
+    """Warn when CU_NUM names a count AITER_GPU_TARGETS did not build for."""
+    cu_env = os.getenv("CU_NUM")
+    if not cu_env:
+        return
+    cu_num = _cu_num_or_none(cu_env)
+    if cu_num is None or any(cu == cu_num for _, cu in targets):
+        return
+    logger.warning(
+        "CU_NUM=%s does not match any build target in AITER_GPU_TARGETS (%s). "
+        "The targets decide which kernels are built; CU_NUM still sets the "
+        "count the runtime looks them up by, so every tuned shape falls back "
+        "to the default kernel. Drop CU_NUM, or add a gfx:%s target.",
+        cu_env,
+        ", ".join(f"{gfx}:{cu}" for gfx, cu in targets),
+        cu_num,
+    )
+
+
 def get_build_targets() -> list[tuple[str, int]]:
     """Return (gfx, cu_num) pairs to compile kernels for.
 
@@ -307,6 +327,7 @@ def get_build_targets() -> list[tuple[str, int]]:
     """
     targets = _parse_gpu_targets_env()
     if targets is not None:
+        _warn_cu_num_ignored(targets)
         return targets
 
     if gpu_archs_env_names():
@@ -316,7 +337,23 @@ def get_build_targets() -> list[tuple[str, int]]:
 
         try:
             live_gfx, live_cu = get_gfx_runtime(), get_cu_num()
-        except Exception:  # noqa: BLE001
+        except Exception as e:  # noqa: BLE001
+            named = ", ".join(f"{gfx}:{cu}" for gfx, cu in targets)
+            if _active_device_index() is None:
+                logger.info(
+                    "No GPU to ask; build targets %s take the default count "
+                    "for their arch.",
+                    named,
+                )
+            else:
+                logger.warning(
+                    "A GPU is present but the arch and CU probe failed (%s); "
+                    "build targets %s take the default count for their arch, "
+                    "which is wrong on a binned or partitioned part. Set "
+                    "CU_NUM or AITER_GPU_TARGETS to pin it.",
+                    e,
+                    named,
+                )
             return targets
 
         resolved = []
@@ -542,7 +579,13 @@ def write_name_keyed_lookup_header(
 
 
 def write_lookup_header(
-    output_path, kernels_dict, lookup_head, lookup_template, lookup_end, istune=False
+    output_path,
+    kernels_dict,
+    lookup_head,
+    lookup_template,
+    lookup_end,
+    istune=False,
+    extra_format_args=None,
 ):
     """Write a C++ GEMM dispatch lookup header from a kernels_dict.
 
@@ -564,7 +607,16 @@ def write_lookup_header(
         lookup_template: String with {MNK} and {kernel_name} placeholders.
         lookup_end:      String written after the loop (closes the macro / #endif).
         istune:          True when generating the tune-mode lookup (int kernelId keys).
+        extra_format_args: Optional callable returning additional format arguments
+                           for a kernel instance.
     """
+
+    def format_entry(key_value, kernel):
+        format_args = {"MNK": key_value, "kernel_name": kernel.name}
+        if extra_format_args is not None:
+            format_args.update(extra_format_args(kernel))
+        return lookup_template.format(**format_args)
+
     with open(output_path, "w") as f:
         f.write(lookup_head)
         for key, k in kernels_dict.items():
@@ -575,14 +627,9 @@ def write_lookup_header(
                 cpp_key = (
                     '{"' + key[0] + '", ' + ", ".join(str(x) for x in key[1:]) + "}"
                 )
-                f.write(
-                    lookup_template.format(
-                        MNK=cpp_key,
-                        kernel_name=k.name,
-                    )
-                )
+                f.write(format_entry(cpp_key, k))
             elif istune and isinstance(key, int) and key >= 0:
-                f.write(lookup_template.format(MNK=key, kernel_name=k.name))
+                f.write(format_entry(key, k))
         f.write(lookup_end)
 
 
